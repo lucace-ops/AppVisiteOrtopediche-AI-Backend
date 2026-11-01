@@ -3,7 +3,7 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 function cors(res) {
   res.setHeader('Access-Control-Allow-Origin', ALLOWED_ORIGIN);
   res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, X-App-Access-Code');
   res.setHeader('Cache-Control', 'no-store');
 }
 
@@ -21,7 +21,6 @@ function safeParseStructured(data) {
   const raw = getOutputText(data);
   if (!raw) return null;
   try { return JSON.parse(raw); } catch {}
-  // Fallback difensivo: alcuni client/proxy possono restituire testo con delimitatori.
   const first = raw.indexOf('{');
   const last = raw.lastIndexOf('}');
   if (first >= 0 && last > first) {
@@ -35,6 +34,14 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Metodo non consentito' });
   if (!process.env.OPENAI_API_KEY) return res.status(500).json({ error: 'OPENAI_API_KEY non configurata sul server' });
+
+  const requiredAccessCode = String(process.env.AI_ACCESS_CODE || '').trim();
+  if (requiredAccessCode) {
+    const suppliedAccessCode = String(req.headers['x-app-access-code'] || '').trim();
+    if (!suppliedAccessCode || suppliedAccessCode !== requiredAccessCode) {
+      return res.status(401).json({ error: 'Codice accesso AI mancante o non valido' });
+    }
+  }
 
   try {
     const body = req.body || {};
