@@ -7,12 +7,27 @@ function cors(res) {
   res.setHeader('Cache-Control', 'no-store');
 }
 
-function extractText(data) {
-  return data.output_text || (data.output || [])
-    .flatMap(x => x.content || [])
-    .filter(x => x.type === 'output_text')
-    .map(x => x.text)
-    .join('\n');
+function getOutputText(data) {
+  if (typeof data?.output_text === 'string' && data.output_text.trim()) return data.output_text.trim();
+  for (const item of (data?.output || [])) {
+    for (const part of (item?.content || [])) {
+      if (part?.type === 'output_text' && typeof part.text === 'string' && part.text.trim()) return part.text.trim();
+    }
+  }
+  return '';
+}
+
+function safeParseStructured(data) {
+  const raw = getOutputText(data);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch {}
+  // Fallback difensivo: alcuni client/proxy possono restituire testo con delimitatori.
+  const first = raw.indexOf('{');
+  const last = raw.lastIndexOf('}');
+  if (first >= 0 && last > first) {
+    try { return JSON.parse(raw.slice(first, last + 1)); } catch {}
+  }
+  return null;
 }
 
 export default async function handler(req, res) {
@@ -40,64 +55,56 @@ REGOLE:
 - Evita liste di esami possibili: proponi approfondimenti solo se cambierebbero concretamente la gestione.
 - Terapia prudente e proporzionata ai dati; il medico deve validarla e verificare controindicazioni, allergie, comorbilità, terapie concomitanti e protocolli locali.
 - Non richiedere o ripetere identificativi del paziente.
-- L'analisi deve essere leggibile in circa 15 secondi: idealmente 150-220 parole, mai oltre 280.
-- Nell'analisi usa solo queste sezioni brevi: Sintesi; Valutazione; Da verificare; Condotta; Red flags.
-- diagnosis_suggestion deve essere 1-2 frasi prudenti utilizzabili nel campo Diagnosi/valutazione.
-- therapy_suggestion deve essere 1-3 frasi sintetiche utilizzabili nel campo Terapia.
-- questions contiene al massimo 4 domande/dati discriminanti realmente utili.`;
+- L'analisi deve essere molto compatta: circa 120-200 parole, massimo 240.
+- Nell'analisi usa solo: Sintesi; Valutazione; Da verificare; Condotta; Red flags.
+- diagnosis_suggestion: 1-2 frasi prudenti utilizzabili nel campo Diagnosi/valutazione.
+- therapy_suggestion: 1-3 frasi sintetiche utilizzabili nel campo Terapia.
+- questions: al massimo 4 dati/domande discriminanti realmente utili.`;
 
     const schema = {
       type: 'object',
       additionalProperties: false,
       properties: {
+        analysis: { type: 'string' },
         diagnosis_suggestion: { type: 'string' },
         therapy_suggestion: { type: 'string' },
-        questions: { type: 'array', items: { type: 'string' }, maxItems: 4 },
-        analysis: { type: 'string' }
+        questions: { type: 'array', items: { type: 'string' }, maxItems: 4 }
       },
-      required: ['diagnosis_suggestion', 'therapy_suggestion', 'questions', 'analysis']
+      required: ['analysis', 'diagnosis_suggestion', 'therapy_suggestion', 'questions']
     };
 
     const r = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-        'Content-Type': 'application/json'
-      },
+      headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: process.env.OPENAI_MODEL || 'gpt-5-mini',
         instructions,
         input,
-        max_output_tokens: 1200,
-        text: {
-          format: {
-            type: 'json_schema',
-            name: 'orthopedic_clinical_review',
-            strict: true,
-            schema
-          }
-        }
+        max_output_tokens: 2000,
+        text: { format: { type: 'json_schema', name: 'orthopedic_clinical_review', strict: true, schema } }
       })
     });
 
     const data = await r.json();
     if (!r.ok) return res.status(r.status).json({ error: data?.error?.message || 'Errore OpenAI API' });
 
-    const raw = extractText(data);
-    if (!raw) return res.status(502).json({ error: 'Risposta AI senza testo' });
+    if (data?.status === 'incomplete') {
+      const reason = data?.incomplete_details?.reason || 'limite di generazione';
+      return res.status(502).json({ error: `Risposta AI interrotta (${reason}). Riprova.` });
+    }
 
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return res.status(502).json({ error: 'Risposta strutturata non interpretabile' });
+    const parsed = safeParseStructured(data);
+    if (!parsed) {
+      const refusal = (data?.output || []).flatMap(x => x?.content || []).find(x => x?.type === 'refusal')?.refusal;
+      if (refusal) return res.status(422).json({ error: `La AI non ha prodotto la revisione: ${refusal}` });
+      return res.status(502).json({ error: 'Risposta AI ricevuta ma non decodificabile. Riprova.' });
     }
 
     return res.status(200).json({
-      analysis: parsed.analysis,
-      diagnosis_suggestion: parsed.diagnosis_suggestion,
-      therapy_suggestion: parsed.therapy_suggestion,
-      questions: parsed.questions.slice(0, 4)
+      analysis: String(parsed.analysis || ''),
+      diagnosis_suggestion: String(parsed.diagnosis_suggestion || ''),
+      therapy_suggestion: String(parsed.therapy_suggestion || ''),
+      questions: Array.isArray(parsed.questions) ? parsed.questions.slice(0, 4).map(String) : []
     });
   } catch (e) {
     return res.status(500).json({ error: e?.message || 'Errore interno' });
